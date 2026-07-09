@@ -14,10 +14,9 @@ services:
     environment:
       FLASK_ENV: "${FLASK_ENV:-production}"
       FLASK_DEBUG: "${FLASK_DEBUG:-0}"
+      PYTHONPATH: "/app"
       SECRET_KEY: "${SECRET_KEY:?SECRET_KEY must be configured in .env}"
       API_TOKEN: "${API_TOKEN:-}"
-      DATABASE_URL: "${DATABASE_URL:-}"
-      ZOHO_API_KEY: "${ZOHO_API_KEY:-}"
 
     restart: unless-stopped
 

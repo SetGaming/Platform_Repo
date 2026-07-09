@@ -1,0 +1,263 @@
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        IMAGE_NAME = 'calculator-app'
+        DEPLOY_DIR = '/home/ec2-user/calculator_app'
+    }
+
+    stages {
+        /*
+         * Pull Request pipeline:
+         * Run only the unit test inside a Python Docker agent.
+         */
+        stage('PR - Unit Test') {
+            when {
+                beforeAgent true
+                changeRequest()
+            }
+
+            agent {
+                docker {
+                    image 'python:3.9-slim'
+                }
+            }
+
+            steps {
+                checkout scm
+
+                sh '''
+                    set -e
+
+                    echo "Pull Request: ${CHANGE_ID}"
+                    echo "Source branch: ${CHANGE_BRANCH}"
+                    echo "Target branch: ${CHANGE_TARGET}"
+
+                    python --version
+
+                    python -m pip install \
+                        --no-cache-dir \
+                        -r requirements.txt \
+                        pytest
+
+                    export PYTHONPATH="$WORKSPACE"
+
+                    python -m pytest \
+                        -v \
+                        tests/test_calculator_logic.py
+                '''
+            }
+        }
+
+        /*
+         * Master pipeline:
+         * Build the application image and run the integration test.
+         *
+         * The host Docker socket is mounted into the Docker agent,
+         * allowing the agent to use the platform EC2 Docker daemon.
+         */
+        stage('Master - Build and Integration Test') {
+            when {
+                beforeAgent true
+                branch 'master'
+            }
+
+            agent {
+                docker {
+                    image 'docker:27-cli'
+                    args '-u root -v /var/run/docker.sock:/var/run/docker.sock'
+                }
+            }
+
+            steps {
+                checkout scm
+
+                sh '''
+                    set -e
+
+                    echo "Building release from branch: ${BRANCH_NAME}"
+                    echo "Build number: ${BUILD_NUMBER}"
+
+                    docker version
+
+                    docker build \
+                        --tag "${IMAGE_NAME}:${BUILD_NUMBER}" \
+                        --tag "${IMAGE_NAME}:latest" \
+                        .
+
+                    echo "Running integration test inside the application image..."
+
+                    docker run --rm \
+                        --env PYTHONPATH=/app \
+                        --env SECRET_KEY=jenkins-integration-test \
+                        "${IMAGE_NAME}:${BUILD_NUMBER}" \
+                        python -m pytest \
+                            -v \
+                            tests/test_calculator_app_integration.py
+                '''
+            }
+        }
+
+        /*
+         * Deploy only after the integration test succeeds.
+         */
+        stage('Master - Deploy to Application EC2') {
+            when {
+                beforeAgent true
+                branch 'master'
+            }
+
+            agent {
+                docker {
+                    image 'docker:27-cli'
+                    args '-u root -v /var/run/docker.sock:/var/run/docker.sock'
+                }
+            }
+
+            steps {
+                checkout scm
+
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'app-ec2-ssh',
+                        keyFileVariable: 'APP_SSH_KEY',
+                        usernameVariable: 'APP_SSH_USER'
+                    ),
+
+                    string(
+                        credentialsId: 'app-ec2-host',
+                        variable: 'APP_HOST'
+                    ),
+
+                    file(
+                        credentialsId: 'calculator-app-env',
+                        variable: 'APP_ENV_FILE'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+                        set +x
+
+                        apk add --no-cache \
+                            openssh-client \
+                            bash
+
+                        chmod 600 "$APP_SSH_KEY"
+
+                        RELEASE_FILE="${IMAGE_NAME}-${BUILD_NUMBER}.tar"
+
+                        echo "Saving Docker image..."
+
+                        docker save \
+                            --output "$RELEASE_FILE" \
+                            "${IMAGE_NAME}:${BUILD_NUMBER}"
+
+                        echo "Testing SSH connection to application EC2..."
+
+                        ssh \
+                            -o StrictHostKeyChecking=accept-new \
+                            -o ConnectTimeout=10 \
+                            -i "$APP_SSH_KEY" \
+                            "$APP_SSH_USER@$APP_HOST" \
+                            "echo 'SSH connection successful'"
+
+                        echo "Creating deployment directory..."
+
+                        ssh \
+                            -o StrictHostKeyChecking=accept-new \
+                            -i "$APP_SSH_KEY" \
+                            "$APP_SSH_USER@$APP_HOST" \
+                            "mkdir -p '${DEPLOY_DIR}'"
+
+                        echo "Copying release image..."
+
+                        scp \
+                            -o StrictHostKeyChecking=accept-new \
+                            -i "$APP_SSH_KEY" \
+                            "$RELEASE_FILE" \
+                            "$APP_SSH_USER@$APP_HOST:${DEPLOY_DIR}/"
+
+                        echo "Copying Docker Compose configuration..."
+
+                        scp \
+                            -o StrictHostKeyChecking=accept-new \
+                            -i "$APP_SSH_KEY" \
+                            compose.yaml \
+                            "$APP_SSH_USER@$APP_HOST:${DEPLOY_DIR}/compose.yaml"
+
+                        echo "Copying protected environment file..."
+
+                        scp \
+                            -o StrictHostKeyChecking=accept-new \
+                            -i "$APP_SSH_KEY" \
+                            "$APP_ENV_FILE" \
+                            "$APP_SSH_USER@$APP_HOST:${DEPLOY_DIR}/.env.new"
+
+                        echo "Starting remote deployment..."
+
+                        ssh \
+                            -o StrictHostKeyChecking=accept-new \
+                            -i "$APP_SSH_KEY" \
+                            "$APP_SSH_USER@$APP_HOST" \
+                            "IMAGE_NAME='${IMAGE_NAME}' \
+                             IMAGE_TAG='${BUILD_NUMBER}' \
+                             DEPLOY_DIR='${DEPLOY_DIR}' \
+                             bash -s" <<'REMOTE_DEPLOY'
+                            set -e
+
+                            cd "$DEPLOY_DIR"
+
+                            mv .env.new .env
+                            chmod 600 .env
+
+                            docker load \
+                                --input "${IMAGE_NAME}-${IMAGE_TAG}.tar"
+
+                            IMAGE_URI="$IMAGE_NAME" \
+                            IMAGE_TAG="$IMAGE_TAG" \
+                            docker compose \
+                                --env-file .env \
+                                up -d \
+                                --no-build \
+                                --remove-orphans
+
+                            echo "Waiting for application container..."
+
+                            sleep 5
+
+                            docker compose \
+                                --env-file .env \
+                                ps
+
+                            docker inspect \
+                                --format='Container status: {{.State.Status}}' \
+                                calculator-app
+
+                            rm -f "${IMAGE_NAME}-${IMAGE_TAG}.tar"
+
+                            docker image prune -f
+REMOTE_DEPLOY
+
+                        rm -f "$RELEASE_FILE"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. The application was not deployed.'
+        }
+    }
+}
