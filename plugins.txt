@@ -4,3 +4,4 @@ docker-workflow
 git
 github-branch-source
 ssh-agent
+junit
