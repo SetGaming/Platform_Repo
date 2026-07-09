@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv
+env
+.env
+coverage.xml
+htmlcov
+.DS_Store
+Jenkinsfile
+README.md
